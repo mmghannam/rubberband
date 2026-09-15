@@ -1,5 +1,6 @@
 """Contains AnalyzeExternalView: hand a run/comparison off to LogAnalyzer."""
 
+import asyncio
 import json
 import logging
 import os
@@ -84,8 +85,9 @@ class AnalyzeExternalView(BaseHandler):
         if not ts_ids:
             raise HTTPError(400, reason="No testsets given.")
         # Only the raw logs are needed here (results/settings are not), so use
-        # the lightweight loader that skips the expensive result scan.
-        ts_list = load_testsets_files(ts_ids)
+        # the lightweight loader that skips the expensive result scan. It runs in
+        # a worker thread (off the event loop) and fetches the runs concurrently.
+        ts_list = await asyncio.to_thread(load_testsets_files, ts_ids)
 
         # Build the same raw-log archive the download button produces. LogAnalyzer
         # detects the Rubberband filename convention and re-parses with its own
