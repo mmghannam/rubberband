@@ -213,6 +213,40 @@ def load_testsets(ids):
     return tss
 
 
+def load_testsets_files(ids):
+    """
+    Load TestSets and their associated File objects only.
+
+    Lightweight variant of :func:`load_testsets` for paths that only hand the
+    raw log files on to another tool (download/analyze): the TestSet document
+    and its File documents are all they need. It deliberately skips
+    ``load_results()``/``load_settings()``, which fetch every result (very wide
+    documents) and the settings and dominate the request time, so each TestSet
+    costs 2 Elasticsearch round-trips (one get + one file scroll) instead of a
+    result scroll plus ~6 extra queries.
+
+    Parameters
+    ----------
+    ids : list
+        List of ids of TestSets
+
+    Returns
+    -------
+    list
+        List of TestSets with their ``files`` loaded
+    """
+    tss = []
+    try:
+        for id in ids:
+            t = TestSet.get(id=id)
+            t.load_files()
+            tss.append(t)
+    except Exception:  # noqa: BLE001 - mirror load_testsets behaviour
+        raise HTTPError(404)
+
+    return tss
+
+
 def get_same_status(runs):
     """
     Get a list of instance names that have the same status in all given TestSets.
