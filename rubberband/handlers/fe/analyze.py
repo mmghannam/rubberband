@@ -90,8 +90,14 @@ class AnalyzeExternalView(BaseHandler):
         # Build the same raw-log archive the download button produces. LogAnalyzer
         # detects the Rubberband filename convention and re-parses with its own
         # parser, so we hand over the raw logs, not Rubberband's parsed data.
+        #
+        # Use ZIP_STORED (no deflate): LogAnalyzer runs on the same machine, so
+        # the larger archive costs nothing on the loopback link, and skipping
+        # compression avoids the deflate CPU here and the inflate CPU in
+        # LogAnalyzer. The download button below stays ZIP_DEFLATED because that
+        # archive goes to the user's browser over the network.
         with BytesIO() as byteio:
-            with zipfile.ZipFile(byteio, "w", zipfile.ZIP_DEFLATED) as archive:
+            with zipfile.ZipFile(byteio, "w", zipfile.ZIP_STORED) as archive:
                 for ts in ts_list:
                     for ftype in EXPORT_FILE_TYPES:
                         try:
