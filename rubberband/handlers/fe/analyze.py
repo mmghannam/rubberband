@@ -23,6 +23,57 @@ from .result import load_testsets_files
 
 logger = logging.getLogger(__name__)
 
+# Streaming progress page shown while the /analyze handoff runs. The handler
+# writes this once, flushes it so the spinner appears immediately, then streams
+# <script> chunks that update the stage text as each step completes, and finally
+# streams a window.location redirect. The page is self-contained (no CDN).
+_PROGRESS_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Handing off to LogAnalyzer…</title>
+<style>
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+         background:#f5f7fa; display:flex; align-items:center; justify-content:center; min-height:100vh; }
+  .card { background:#fff; border-radius:12px; box-shadow:0 4px 24px rgba(0,0,0,.08);
+          padding:40px 48px; max-width:540px; text-align:center; }
+  .spinner { width:48px; height:48px; border:5px solid #e6ecf3; border-top-color:#2eb3b3;
+             border-radius:50%; margin:0 auto 20px; animation:spin .9s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  h1 { font-size:20px; color:#2c3e50; margin:0 0 6px; }
+  p.stage { color:#5a6b7b; font-size:14px; margin:0; min-height:20px; }
+  .steps { margin-top:20px; text-align:left; font-size:13px; }
+  .steps div { padding:4px 0; color:#c8d1d9; }
+  .steps .done { color:#2eb3b3; }
+  .steps .active { color:#2c3e50; font-weight:600; }
+  .steps .error { color:#c0392b; font-weight:600; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="spinner" id="spinner"></div>
+  <h1>Handing off to LogAnalyzer</h1>
+  <p class="stage" id="stage">Preparing…</p>
+  <div class="steps" id="steps"></div>
+</div>
+<script>
+  function setStage(msg){ document.getElementById('stage').textContent = msg; }
+  function addStep(label, active){
+    var el = document.createElement('div');
+    el.textContent = label;
+    el.className = active ? 'active' : 'done';
+    document.getElementById('steps').appendChild(el);
+  }
+  function setFailed(msg){
+    document.getElementById('spinner').style.display = 'none';
+    setStage(msg);
+    var e = document.createElement('div'); e.className = 'error'; e.textContent = msg;
+    document.getElementById('steps').appendChild(e);
+  }
+</script>
+"""
+
 
 def _result_coverage(ts_ids):
     """Count parsed results per testset in Elasticsearch (one cheap agg query).
@@ -121,11 +172,48 @@ def _encode_multipart(fields, files):
 class AnalyzeExternalView(BaseHandler):
     """Bundle one or more TestSets and hand them to a LogAnalyzer instance."""
 
+    # --- streaming progress page helpers -----------------------------------
+    async def _progress_start(self):
+        """Start the staged progress page; the spinner renders immediately."""
+        self.set_header("Content-Type", "text/html; charset=UTF-8")
+        self.set_header("Cache-Control", "no-store")
+        self.write(_PROGRESS_PAGE)
+        await self.flush()
+
+    async def _stage(self, label, message):
+        """Mark a step done and stream the current-stage text."""
+        self.write(
+            "<script>addStep({}, false); setStage({});</script>\n".format(
+                json.dumps(label), json.dumps(message)
+            )
+        )
+        await self.flush()
+
+    async def _progress_redirect(self, url):
+        """Finish the progress page and send the browser to LogAnalyzer."""
+        self.write(
+            "<script>addStep('Opening in LogAnalyzer', true); "
+            "setStage('Redirecting to LogAnalyzer…');</script>\n"
+        )
+        self.write("<script>window.location.replace({});</script>\n".format(json.dumps(url)))
+        self.write("</body></html>")
+        await self.flush()
+        self.finish()
+
+    async def _progress_fail(self, message):
+        """Show an error on the progress page instead of a blank/half page."""
+        logger.error("LogAnalyzer handoff failed: %s", message)
+        self.write(
+            "<script>setFailed({});</script>\n</body></html>".format(json.dumps(message))
+        )
+        await self.flush()
+        self.finish()
+
     async def _handoff_from_es(self, ts_ids):
         """Ask LogAnalyzer to import the testsets' already-parsed ES results.
 
-        Returns True when the ES path was used (the caller should return), False
-        when it should fall back to the raw-log upload.
+        Returns the LogAnalyzer redirect URL when the ES path was used, or None
+        when the caller should fall back to the raw-log upload.
         """
         base = options.loganalyzer_url.rstrip("/")
         public_base = (
@@ -133,11 +221,16 @@ class AnalyzeExternalView(BaseHandler):
         ).rstrip("/")
         groups = await asyncio.to_thread(_es_run_groups, ts_ids)
         if not groups:
-            return False
+            return None
         runs = [
             {"name": name, "settings": g["settings"], "testset_ids": g["testset_ids"]}
             for name, g in groups.items()
         ]
+        await self._stage(
+            "Importing from Elasticsearch",
+            f"Found parsed results — importing {len(runs)} run(s) "
+            f"from Elasticsearch (no re-parse)…",
+        )
         body = json.dumps(
             {
                 "es_url": options.elasticsearch_url,
@@ -157,23 +250,21 @@ class AnalyzeExternalView(BaseHandler):
             payload = json.loads(response.body)
         except Exception as e:  # noqa: BLE001 - fall back to the raw upload
             logger.warning("import-from-es failed (%r); falling back to raw upload", e)
-            return False
+            return None
 
         created = payload.get("runs") or []
         if not created or payload.get("skipped"):
             # no/partial parsed results - let the raw-log upload handle it
-            return False
+            return None
         run_ids = [r["run_id"] for r in created if r.get("run_id")]
         if not run_ids:
-            return False
+            return None
         logger.info("LogAnalyzer ES handoff: runs %s", run_ids)
         if len(run_ids) == 2:
-            self.redirect(public_base + "/compare?runs=" + ",".join(run_ids))
-        elif len(run_ids) == 1:
-            self.redirect("{}/instances/{}".format(public_base, run_ids[0]))
-        else:
-            self.redirect(public_base + "/")
-        return True
+            return public_base + "/compare?runs=" + ",".join(run_ids)
+        if len(run_ids) == 1:
+            return "{}/instances/{}".format(public_base, run_ids[0])
+        return public_base + "/"
 
     async def get(self, testsets):
         """
@@ -198,6 +289,14 @@ class AnalyzeExternalView(BaseHandler):
         if not ts_ids:
             raise HTTPError(400, reason="No testsets given.")
 
+        # Stream a staged progress page so the user sees what is happening while
+        # the handoff runs (it can take several seconds for the ES import or the
+        # raw-log upload), instead of a blank tab that looks stuck.
+        await self._progress_start()
+        await self._stage(
+            "Contacting Elasticsearch", "Checking for already-parsed results…"
+        )
+
         # Fast path: if every testset already has parsed results in Elasticsearch,
         # hand those to LogAnalyzer directly. This skips shipping the raw logs
         # (~116 MB for a C6520 comparison) and LogAnalyzer re-parsing them
@@ -207,13 +306,23 @@ class AnalyzeExternalView(BaseHandler):
         # fall back to the raw-log upload below.
         coverage = await asyncio.to_thread(_result_coverage, ts_ids)
         if coverage and all(coverage.get(t, 0) > 0 for t in ts_ids):
-            if await self._handoff_from_es(ts_ids):
+            redirect_url = await self._handoff_from_es(ts_ids)
+            if redirect_url:
+                await self._progress_redirect(redirect_url)
                 return
 
         # Only the raw logs are needed here (results/settings are not), so use
         # the lightweight loader that skips the expensive result scan. It runs in
         # a worker thread (off the event loop) and fetches the runs concurrently.
-        ts_list = await asyncio.to_thread(load_testsets_files, ts_ids)
+        await self._stage(
+            "Downloading raw logs",
+            "No parsed results in Elasticsearch — downloading the raw logs…",
+        )
+        try:
+            ts_list = await asyncio.to_thread(load_testsets_files, ts_ids)
+        except Exception as e:  # noqa: BLE001 - show a helpful error on the page
+            await self._progress_fail("Could not load the selected testsets: " + str(e))
+            return
 
         # Build the same raw-log archive the download button produces. LogAnalyzer
         # detects the Rubberband filename convention and re-parses with its own
@@ -246,6 +355,10 @@ class AnalyzeExternalView(BaseHandler):
         )
 
         label = (", ".join(ts.filename for ts in ts_list))[:120] or "Rubberband run"
+        await self._stage(
+            "Uploading to LogAnalyzer",
+            f"Uploading {len(ts_list)} raw log(s) to LogAnalyzer…",
+        )
         body, content_type = _encode_multipart(
             fields={"name": label, "description": "Imported from Rubberband"},
             files=[("files", "rubberband.zip", "application/zip", zip_bytes)],
@@ -266,12 +379,14 @@ class AnalyzeExternalView(BaseHandler):
                 logger.error(
                     "LogAnalyzer upload response body: %s", e.response.body[:1000]
                 )
-            raise HTTPError(502, reason="Could not reach LogAnalyzer: " + e)
+            await self._progress_fail("Could not reach LogAnalyzer: " + str(e))
+            return
 
         try:
             payload = json.loads(response.body)
         except ValueError:
-            raise HTTPError(502, reason="Unexpected response from LogAnalyzer.")
+            await self._progress_fail("Unexpected response from LogAnalyzer.")
+            return
 
         # A single run lands directly on its instances page. When LogAnalyzer
         # splits a Rubberband comparison into several runs (it groups by setting),
@@ -282,12 +397,16 @@ class AnalyzeExternalView(BaseHandler):
         # LogAnalyzer currently only renders two-run comparisons, so anything
         # larger falls back to the dashboard where the fresh runs appear.
         if payload.get("run_id"):
-            self.redirect("{}/instances/{}".format(public_base, payload["run_id"]))
+            await self._progress_redirect(
+                "{}/instances/{}".format(public_base, payload["run_id"])
+            )
         elif payload.get("runs"):
             run_ids = [r["run_id"] for r in payload["runs"] if r.get("run_id")]
             if len(run_ids) == 2:
-                self.redirect(public_base + "/compare?runs=" + ",".join(run_ids))
+                await self._progress_redirect(
+                    public_base + "/compare?runs=" + ",".join(run_ids)
+                )
             else:
-                self.redirect(public_base + "/")
+                await self._progress_redirect(public_base + "/")
         else:
-            raise HTTPError(502, reason="Unexpected response from LogAnalyzer.")
+            await self._progress_fail("Unexpected response from LogAnalyzer.")
