@@ -4,20 +4,79 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
+from elasticsearch.dsl import Search
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 from tornado.options import options
 from tornado.web import HTTPError
 
-from rubberband.constants import EXPORT_FILE_TYPES
+from rubberband.constants import EXPORT_FILE_TYPES, RESULT_INDEX
+from rubberband.models import TestSet
 
 from .base import BaseHandler
 from .result import load_testsets_files
 
 logger = logging.getLogger(__name__)
+
+
+def _result_coverage(ts_ids):
+    """Count parsed results per testset in Elasticsearch (one cheap agg query).
+
+    Returns a ``{testset_id: count}`` dict. An empty dict means ES is
+    unreachable or nothing matched, which callers treat as "no results".
+    """
+    try:
+        search = Search(index=RESULT_INDEX).query("terms", testset_id=ts_ids)
+        search.aggs.bucket("per_ts", "terms", field="testset_id", size=len(ts_ids))
+        resp = search.execute()
+        return {b.key: b.doc_count for b in resp.aggregations.per_ts.buckets}
+    except Exception:  # noqa: BLE001 - coverage is advisory
+        return {}
+
+
+def _es_run_groups(ts_ids):
+    """Group testsets into runs by their filename's setting.
+
+    Mirrors LogAnalyzer's rubberband convention
+    ``check.<testset>.<binary_timestamp>.<queue>.<setting>-s<seed>.out``: testsets
+    that share a setting (differ only by seed) belong to the same run. Returns
+    ``{run_name: {"settings": ..., "testset_ids": [...]}}``.
+    """
+    def _load(ts_id):
+        try:
+            return TestSet.get(id=ts_id)
+        except Exception:  # noqa: BLE001 - skip unreadable testsets
+            return None
+
+    if len(ts_ids) == 1:
+        testsets = [_load(ts_ids[0])]
+    else:
+        with ThreadPoolExecutor(max_workers=min(len(ts_ids), 8)) as executor:
+            testsets = list(executor.map(_load, ts_ids))
+
+    groups = {}
+    for ts in testsets:
+        if ts is None:
+            continue
+        stem = os.path.splitext(ts.filename or "")[0]
+        stem = re.sub(r"-s\d+$", "", stem)  # strip the -s<seed> suffix
+        parts = stem.split(".")
+        if len(parts) >= 5 and parts[0] == "check":
+            # drop the timestamp from the binary part, like LogAnalyzer does
+            binary = parts[2].rsplit("_", 1)[0] if "_" in parts[2] else parts[2]
+            name = ".".join([parts[0], parts[1], binary, parts[3], parts[-1]])
+        else:
+            name = stem
+        settings = parts[-1] if parts else ""
+        groups.setdefault(
+            name, {"settings": settings, "testset_ids": []}
+        )["testset_ids"].append(ts.meta.id)
+    return groups
 
 
 def _encode_multipart(fields, files):
@@ -62,6 +121,60 @@ def _encode_multipart(fields, files):
 class AnalyzeExternalView(BaseHandler):
     """Bundle one or more TestSets and hand them to a LogAnalyzer instance."""
 
+    async def _handoff_from_es(self, ts_ids):
+        """Ask LogAnalyzer to import the testsets' already-parsed ES results.
+
+        Returns True when the ES path was used (the caller should return), False
+        when it should fall back to the raw-log upload.
+        """
+        base = options.loganalyzer_url.rstrip("/")
+        public_base = (
+            options.loganalyzer_public_url or options.loganalyzer_url
+        ).rstrip("/")
+        groups = await asyncio.to_thread(_es_run_groups, ts_ids)
+        if not groups:
+            return False
+        runs = [
+            {"name": name, "settings": g["settings"], "testset_ids": g["testset_ids"]}
+            for name, g in groups.items()
+        ]
+        body = json.dumps(
+            {
+                "es_url": options.elasticsearch_url,
+                "description": "Imported from Rubberband",
+                "runs": runs,
+            }
+        ).encode()
+        request = HTTPRequest(
+            url=f"{base}/api/import-from-es",
+            method="POST",
+            body=body,
+            headers={"Content-Type": "application/json"},
+            request_timeout=120,
+        )
+        try:
+            response = await AsyncHTTPClient().fetch(request)
+            payload = json.loads(response.body)
+        except Exception as e:  # noqa: BLE001 - fall back to the raw upload
+            logger.warning("import-from-es failed (%r); falling back to raw upload", e)
+            return False
+
+        created = payload.get("runs") or []
+        if not created or payload.get("skipped"):
+            # no/partial parsed results - let the raw-log upload handle it
+            return False
+        run_ids = [r["run_id"] for r in created if r.get("run_id")]
+        if not run_ids:
+            return False
+        logger.info("LogAnalyzer ES handoff: runs %s", run_ids)
+        if len(run_ids) == 2:
+            self.redirect(public_base + "/compare?runs=" + ",".join(run_ids))
+        elif len(run_ids) == 1:
+            self.redirect("{}/instances/{}".format(public_base, run_ids[0]))
+        else:
+            self.redirect(public_base + "/")
+        return True
+
     async def get(self, testsets):
         """
         Zip the raw logs of the given testsets, upload them to LogAnalyzer and
@@ -84,6 +197,19 @@ class AnalyzeExternalView(BaseHandler):
         ts_ids = [t for t in testsets.split(",") if t]
         if not ts_ids:
             raise HTTPError(400, reason="No testsets given.")
+
+        # Fast path: if every testset already has parsed results in Elasticsearch,
+        # hand those to LogAnalyzer directly. This skips shipping the raw logs
+        # (~116 MB for a C6520 comparison) and LogAnalyzer re-parsing them
+        # (~6 s/run), which dominate the cold handoff. LogAnalyzer's
+        # import-from-es endpoint builds runs from the already-parsed values
+        # (verified equivalent to its own parse). If any testset lacks results,
+        # fall back to the raw-log upload below.
+        coverage = await asyncio.to_thread(_result_coverage, ts_ids)
+        if coverage and all(coverage.get(t, 0) > 0 for t in ts_ids):
+            if await self._handoff_from_es(ts_ids):
+                return
+
         # Only the raw logs are needed here (results/settings are not), so use
         # the lightweight loader that skips the expensive result scan. It runs in
         # a worker thread (off the event loop) and fetches the runs concurrently.
