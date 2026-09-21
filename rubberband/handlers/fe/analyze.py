@@ -198,32 +198,16 @@ class AnalyzeExternalView(BaseHandler):
         if not ts_ids:
             raise HTTPError(400, reason="No testsets given.")
 
-        # Fast path: if every testset already has parsed results in Elasticsearch,
-        # hand those to LogAnalyzer directly. This skips shipping the raw logs
-        # (~116 MB for a C6520 comparison) and LogAnalyzer re-parsing them
-        # (~6 s/run), which dominate the cold handoff. LogAnalyzer's
-        # import-from-es endpoint builds runs from the already-parsed values
-        # (verified equivalent to its own parse). If any testset lacks results,
-        # fall back to the raw-log upload below.
+        # Fast path: if every testset has parsed results, hand those to LogAnalyzer directly.
         coverage = await asyncio.to_thread(_result_coverage, ts_ids)
         if coverage and all(coverage.get(t, 0) > 0 for t in ts_ids):
             if await self._handoff_from_es(ts_ids):
                 return
 
-        # Only the raw logs are needed here (results/settings are not), so use
-        # the lightweight loader that skips the expensive result scan. It runs in
-        # a worker thread (off the event loop) and fetches the runs concurrently.
+        # Only the raw logs are needed here, so use the loader that skips the result scan.
         ts_list = await asyncio.to_thread(load_testsets_files, ts_ids)
 
-        # Build the same raw-log archive the download button produces. LogAnalyzer
-        # detects the Rubberband filename convention and re-parses with its own
-        # parser, so we hand over the raw logs, not Rubberband's parsed data.
-        #
-        # Use ZIP_STORED (no deflate): LogAnalyzer runs on the same machine, so
-        # the larger archive costs nothing on the loopback link, and skipping
-        # compression avoids the deflate CPU here and the inflate CPU in
-        # LogAnalyzer. The download button below stays ZIP_DEFLATED because that
-        # archive goes to the user's browser over the network.
+        # Build the raw-log archive the download button produces (LogAnalyzer re-parses it); ZIP_STORED since it's loopback.
         with BytesIO() as byteio:
             with zipfile.ZipFile(byteio, "w", zipfile.ZIP_STORED) as archive:
                 for ts in ts_list:
@@ -273,14 +257,7 @@ class AnalyzeExternalView(BaseHandler):
         except ValueError:
             raise HTTPError(502, reason="Unexpected response from LogAnalyzer.")
 
-        # A single run lands directly on its instances page. When LogAnalyzer
-        # splits a Rubberband comparison into several runs (it groups by setting),
-        # it returns {"multiple_runs": true, "runs": [...]} with no top-level
-        # run_id. For a two-run comparison we hand the run ids straight to
-        # LogAnalyzer's /compare route, which skips the dashboard, creates (or
-        # reuses a cached) comparison and lands the user on the comparison page.
-        # LogAnalyzer currently only renders two-run comparisons, so anything
-        # larger falls back to the dashboard where the fresh runs appear.
+        # One run -> its instances page; two runs -> /compare; more -> the dashboard.
         if payload.get("run_id"):
             self.redirect("{}/instances/{}".format(public_base, payload["run_id"]))
         elif payload.get("runs"):
