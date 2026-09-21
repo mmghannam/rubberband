@@ -170,7 +170,7 @@ class AnalyzeExternalView(BaseHandler):
         if len(run_ids) == 2:
             self.redirect(public_base + "/compare?runs=" + ",".join(run_ids))
         elif len(run_ids) == 1:
-            self.redirect("{}/instances/{}".format(public_base, run_ids[0]))
+            self.redirect(f"{public_base}/instances/{run_ids[0]}")
         else:
             self.redirect(public_base + "/")
         return True
@@ -200,9 +200,12 @@ class AnalyzeExternalView(BaseHandler):
 
         # Fast path: if every testset has parsed results, hand those to LogAnalyzer directly.
         coverage = await asyncio.to_thread(_result_coverage, ts_ids)
-        if coverage and all(coverage.get(t, 0) > 0 for t in ts_ids):
-            if await self._handoff_from_es(ts_ids):
-                return
+        if (
+            coverage
+            and all(coverage.get(t, 0) > 0 for t in ts_ids)
+            and await self._handoff_from_es(ts_ids)
+        ):
+            return
 
         # Only the raw logs are needed here, so use the loader that skips the result scan.
         ts_list = await asyncio.to_thread(load_testsets_files, ts_ids)
