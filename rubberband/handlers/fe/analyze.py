@@ -183,9 +183,7 @@ class AnalyzeExternalView(BaseHandler):
     async def _stage(self, label, message):
         """Mark a step done and stream the current-stage text."""
         self.write(
-            "<script>addStep({}, false); setStage({});</script>\n".format(
-                json.dumps(label), json.dumps(message)
-            )
+            f"<script>addStep({json.dumps(label)}, false); setStage({json.dumps(message)});</script>\n"
         )
         await self.flush()
 
@@ -195,7 +193,7 @@ class AnalyzeExternalView(BaseHandler):
             "<script>addStep('Opening in LogAnalyzer', true); "
             "setStage('Redirecting to LogAnalyzer…');</script>\n"
         )
-        self.write("<script>window.location.replace({});</script>\n".format(json.dumps(url)))
+        self.write(f"<script>window.location.replace({json.dumps(url)});</script>\n")
         self.write("</body></html>")
         await self.flush()
         self.finish()
@@ -204,7 +202,7 @@ class AnalyzeExternalView(BaseHandler):
         """Show an error on the progress page instead of a blank/half page."""
         logger.error("LogAnalyzer handoff failed: %s", message)
         self.write(
-            "<script>setFailed({});</script>\n</body></html>".format(json.dumps(message))
+            f"<script>setFailed({json.dumps(message)});</script>\n</body></html>"
         )
         await self.flush()
         self.finish()
@@ -263,7 +261,7 @@ class AnalyzeExternalView(BaseHandler):
         if len(run_ids) == 2:
             return public_base + "/compare?runs=" + ",".join(run_ids)
         if len(run_ids) == 1:
-            return "{}/instances/{}".format(public_base, run_ids[0])
+            return f"{public_base}/instances/{run_ids[0]}"
         return public_base + "/"
 
     async def get(self, testsets):
